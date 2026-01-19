@@ -428,3 +428,312 @@ response = bedrock.converse(
     },
 )
 ```
+
+
+#### Converse API
+
+Build conversational applications while maintaining context across multiple interactions
+
+Standard foundational model calls are stateless; Converse API provides structured way to maintain conversation history and context
+
+Provides unified way to invoke foundation models, allowing one to swap out models when needed
+
+Components of using Converse API:
+* System prompt
+* Message Array - stores conversation history between user and the model
+  ```
+  messages = [
+    {
+
+        "role": "user",
+
+        "content": "Create a playlist of 3 pop songs"
+
+    }
+
+  ]
+  ```
+
+* Inference parameters: control how model generate respinses; different models support different parameters e.g.
+  ```
+  inference_config = {
+     "temperature": 0.7,
+     "max_tokens": 1024,
+     "top_p": 0.999,
+  }
+
+  additional_model_fields = {"top_k": top_k}
+  ```
+
+Example of invoking the converse API using boto3:
+```
+response = bedrock.converse(
+     modelId="<MODEL ID>",
+     messages=mmessages,
+     system=system_prompt,
+     inferenceConfig=inference_config,
+     additionalModelRequestFields=additional_model_fields
+)
+```
+
+
+#### Considerations when implementing
+
+* Context Window Management
+  The context window defines how much information the model can process at once, measured in tokens.
+
+  When building conversational applications, need to manage this limitation:
+  * Monitor total tokens in conversation history
+  * Implement conversation summarization or pruning for long interactions
+  * Consider model-specific token limits
+  * Handle cases where context window exceeded
+
+* Production Best Practices
+  When deploying to production:
+  * Store conversation histories in DynamoDB or Redis
+  * Implement session management to isolate user conversations
+  * Use session IDs to retrieve relevant conversation history
+  * Handle rate limits and retry logic
+  * Monitor and log model interactions
+
+
+* Model specific Considerations
+  Different foundation models have different capabilities and requirements:
+  * Some models don't support prompts
+  * Different parameters between models
+  * Response formats may differ
+  * Temperature and other inference parameters behave differently
+  * Always check model specific documentation
+
+
+#### Tool configuration
+
+Allows model to interact with external Lambda functions
+e.g.
+
+```
+weather_tool = {
+    "toolSpec": {
+        "name": "getWeather",
+        "description": "Gets the current weather using latitude and longitude.",
+        "inputSchema": {
+            "json": {
+                "type": "object",
+                "properties": {
+                    "lat": {"type": "number"},
+                    "lon": {"type": "number"}
+                },
+                "required": ["lat", "lon"]
+            }
+        }
+    }
+}
+
+initial_response = bedrock.converse(
+    modelId="<MODEL_ID>",
+    system="<system_prompt>",
+    messages=["<initial_user_msg>"],
+    toolConfig={
+        "tools": [weather_tool],
+        "toolChoice": {"auto": {}}
+    },
+    inferenceConfig={"temperature": 0.7}
+)
+
+```
+
+#### Tool Execution Flow
+
+When using tools with Converse API, follow these steps:
+
+* Application sends user's message and available tools to model
+* Model determines if tool needed and includes a **toolUse** block in its response
+* Application must then:
+    * CHeck for presence of toolUse block
+    * Extract the tool params from the response
+    * Execute the appropriate tool ( call Lambda function )
+    * Handle any errors during tool execution
+    * Format tool's results
+* Send the tool's results back to model with original conversation history
+
+Example of flow:
+```
+import json
+import boto3
+
+bedrock = boto3.client(service_name='bedrock-runtime')
+lambda_client = boto3.client("lambda")
+
+MODEL_ID_CLAUDE_SONNET = "anthropic.claude-3-sonnet-20240229-v1:0"
+
+# Define toolSpec for lambda function
+# Lambda function named getWeather already created
+weather_tool = {
+    "toolSpec": {
+        "name": "getWeather",
+        "description": "Gets the current weather using latitude and longitude.",
+        "inputSchema": {
+            "json": {
+                "type": "object",
+                "properties": {
+                    "lat": {"type": "number"},
+                    "lon": {"type": "number"}
+                },
+                "required": ["lat", "lon"]
+            }
+        }
+    }
+}
+
+# Invoke Lambda Function (tool)
+def invoke_weather_lambda(input_data):
+    response = lambda_client.invoke(
+        FunctionName="weather-tool",
+          InvocationType="RequestResponse",
+        Payload=json.dumps(input_data)
+    )
+    payload = response["Payload"].read()
+    result = json.loads(payload)
+    body = result.get("body", "{}")
+    return json.loads(body) if isinstance(body, str) else body
+
+initial_user_msg = {
+    "role": "user",
+    "content": [{"text": "What's the weather like in portland?"}]
+}
+
+system_prompt = [
+    {"text": """
+    You are a helpful assistant that can check the weather using tools when needed.
+     If the user inputs a city name that exists in multiple geogrpahic areas, ask the user for clarification.
+    """}]
+
+# Ask model initial question
+initial_response = bedrock.converse(
+    modelId=MODEL_ID_CLAUDE_SONNET,
+    system=system_prompt,
+    messages=[initial_user_msg],
+    toolConfig={
+        "tools": [weather_tool],
+        "toolChoice": {"auto": {}}
+    },
+    inferenceConfig={"temperature": 0.7}
+)
+
+# Parse response from Claude to determine if tool is needed
+assistant_msg = initial_response["output"]["message"]
+content_blocks = assistant_msg["content"]
+tool_use_block = next((block for block in content_blocks if "toolUse" in block), None)
+
+if not tool_use_block:
+    print("=== Claude Response ===")
+    print(content_blocks[0]["text"])
+else:
+    tool_use = tool_use_block["toolUse"]
+    tool_input = tool_use["input"]
+    tool_use_id = tool_use["toolUseId"]
+    print(tool_use_block)
+    print(f"→ Claude requested tool: getWeather with input: {tool_input}")
+
+    # Invoke tool
+    tool_output = invoke_weather_lambda(tool_input)
+    print(f"← Lambda returned: {tool_output}")
+
+    # Print out tool output
+    try:
+        summary = f"The weather in {tool_output['location']} is currently {tool_output['temperature']} with {tool_output['condition']}."
+    except Exception as e:
+        summary = f"Sorry, I couldn't retrieve the weather. ({str(e)})"
+
+    # Construct tool result message
+    tool_result_msg = {
+        "role": "user",
+        "content": [
+            {
+                "toolResult": {
+                    "toolUseId": tool_use_id,
+                    "content": [{"text": summary}]
+                }
+            }
+        ]
+    }
+
+    # Pass tool result message to model
+    final_response = bedrock.converse(
+        modelId=MODEL_ID_CLAUDE_SONNET,
+        messages=[initial_user_msg, assistant_msg, tool_result_msg],
+        toolConfig={
+              "tools": [weather_tool],
+            "toolChoice": {"auto": {}}
+        },
+        inferenceConfig={"temperature": 0.7}
+    )
+
+    # Print final response
+    final_msg = final_response["output"]["message"]["content"][0]["text"]
+    print("\n=== Final Agent Response ===")
+    print(final_msg)
+
+```
+
+#### Bedrock Flows
+
+Amazon Bedrock Flows is a visual workflow builder that enables developers to create generative AI applications without writing extensive code. This service allows you to orchestrate complex AI workflows by connecting different components through a drag-and-drop interface, making it easier to build and manage AI-powered applications.
+
+The foundation of Bedrock Flows lies in its diverse set of components that handle both flow control and data processing. These components work together to create cohesive, efficient workflows that can scale from simple to complex applications.
+
+#### Flow control
+Flow control components form the backbone of any Bedrock Flow, managing how data moves through the workflow and determining the logical paths for different scenarios.
+
+#### Input and output management
+
+These fundamental components define how data enters and exits your flow, ensuring proper data handling throughout the workflow process.
+
+**Flow Input Node**
+* Serves as the workflow entry point
+* Defines accepted data types
+* Provides reference points for other nodes
+
+**Flow Output Node**
+* Extracts data using flow expression language
+* Supports JSON document queries
+* Handles multiple branch outputs
+
+#### Flow logic controllers
+The logic controllers enable developers to create sophisticated workflows by managing data flow and processing sequences.
+
+**Condition Node**
+* Implements branching logic
+* Processes multiple named inputs
+* Evaluates conditions sequentially
+
+**Iterator Node**
+* Processes array items sequentially
+* Provides array item and size outputs
+* Enables parallel processing
+
+**Collector Node**
+* Aggregates processed items
+* Rebuilds arrays from iterations
+* Combines multiple operation results
+
+#### Data processing
+Data processing components are the workhorses of Bedrock Flows, handling the actual computation and AI model interactions. These components allow you to interact with foundation models and integrate with various AWS services, forming the core functionality of your generative AI applications.
+
+#### AI Integration
+The Prompt Node is the primary way to interact with foundation models in Bedrock. You can:
+* Use inline prompts for quick testing
+* Leverage templated prompts from your prompt library
+* Configure inference parameters for optimal results
+
+#### Service Integration
+Bedrock Flows seamlessly connects with other AWS services through specialized nodes:
+
+* S3 for data storage and retrieval
+* Lambda for custom business logic
+* Lex for natural language processing
+* Bedrock Agents and Knowledge Bases for enhanced AI capabilities
+
+Every flow starts with defining your input, processing your data through various nodes, and producing meaningful output. Whether you're building a simple prompt-response system or a complex multi-step workflow, Bedrock Flows provides the building blocks you need to create powerful AI-driven applications.
+
+
