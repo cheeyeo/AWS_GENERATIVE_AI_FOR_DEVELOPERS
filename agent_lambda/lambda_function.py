@@ -86,7 +86,7 @@ def lambda_handler(event, context):
             params_dict[param.get("name")] = param.get("value")
 
         # Route to appropriate function
-        if function_name == "get_available_vacation_days":
+        if function_name == "get_available_vacations_days":
             employee_id = int(params_dict.get("employee_id"))
             result = get_available_vacations_days(employee_id)
         elif function_name == "reserve_vacation_time":
